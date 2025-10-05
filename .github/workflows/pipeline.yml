@@ -1,0 +1,346 @@
+# .github/workflows/pipeline.yml
+name: Tourism Project Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Change all three to your real repos
+  DATASET_REPO: "your-username/tourism-prediction-package"   # HF Dataset repo
+  MODEL_REPO:   "your-username/tourism-prediction-package"   # HF Model repo (where joblib is uploaded)
+  SPACE_REPO:   "your-username/tourism-prediction-app"       # HF Space repo (Docker runtime)
+  # Optional: public URL to download CSV if not committed
+  # Set in repo Variables or Secrets if you prefer
+  # DATASET_SOURCE_URL: "https://raw.githubusercontent.com/<you>/<repo>/main/tourism.csv"
+
+jobs:
+  register-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas huggingface_hub requests
+
+      - name: Upload tourism.csv to HF Dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET_SOURCE_URL: ${{ vars.DATASET_SOURCE_URL }}
+        run: |
+          python - <<'PY'
+          import os, sys, requests
+          from pathlib import Path
+          from huggingface_hub import HfApi, create_repo
+          from huggingface_hub.utils import RepositoryNotFoundError
+
+          ds_repo = os.environ["DATASET_REPO"]
+          hf_token = os.environ["HF_TOKEN"]
+          src_url = (os.environ.get("DATASET_SOURCE_URL") or "").strip()
+          api = HfApi(token=hf_token)
+
+          # Ensure dataset repo exists
+          try:
+              api.repo_info(repo_id=ds_repo, repo_type="dataset")
+              print(f"[OK] Dataset repo '{ds_repo}' exists.")
+          except RepositoryNotFoundError:
+              print(f"[NEW] Creating dataset repo '{ds_repo}'...")
+              create_repo(repo_id=ds_repo, repo_type="dataset", private=False)
+
+          # Look for tourism.csv locally first
+          candidates = [
+              "tourism_project/data/tourism.csv",
+              "data/tourism.csv",
+              "tourism.csv"
+          ]
+          local_path = next((p for p in candidates if os.path.exists(p)), None)
+
+          if local_path is None:
+              if not src_url:
+                  print("❌ 'tourism.csv' not found and DATASET_SOURCE_URL not set.", file=sys.stderr)
+                  print("Searched:", candidates, file=sys.stderr)
+                  raise FileNotFoundError("Commit tourism.csv or set DATASET_SOURCE_URL to a public CSV URL.")
+              print(f"[DOWNLOAD] {src_url}")
+              out_dir = Path("tourism_project/data")
+              out_dir.mkdir(parents=True, exist_ok=True)
+              local_path = str(out_dir / "tourism.csv")
+              with requests.get(src_url, stream=True, timeout=60) as r:
+                  r.raise_for_status()
+                  with open(local_path, "wb") as f:
+                      for chunk in r.iter_content(8192):
+                          if chunk: f.write(chunk)
+
+          print(f"[UPLOAD] Using: {local_path}")
+          api.upload_file(
+              path_or_fileobj=local_path,
+              path_in_repo="tourism.csv",
+              repo_id=ds_repo,
+              repo_type="dataset",
+          )
+          print("[DONE] Dataset upload complete.")
+          PY
+
+  data-prep:
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas scikit-learn datasets huggingface_hub
+
+      - name: Create X/y splits and push to HF Dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+          from huggingface_hub import HfApi
+
+          ds_repo = os.environ["DATASET_REPO"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          # Load directly from HF dataset
+          hf_path = f"hf://datasets/{ds_repo}/tourism.csv"
+          print(f"[LOAD] {hf_path}")
+          df = pd.read_csv(hf_path)
+
+          # Basic cleanup
+          for col in ["CustomerID", "Unnamed: 0", "Unnamed:0"]:
+              if col in df.columns:
+                  df.drop(columns=[col], inplace=True)
+
+          target = "ProdTaken"
+          if target not in df.columns:
+              raise KeyError(f"Target column '{target}' not found.")
+
+          X = df.drop(columns=[target])
+          y = df[target].astype(int)
+
+          Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+          os.makedirs("prepped", exist_ok=True)
+          Xtr.to_csv("prepped/Xtrain.csv", index=False)
+          Xte.to_csv("prepped/Xtest.csv", index=False)
+          ytr.to_csv("prepped/ytrain.csv", index=False)
+          yte.to_csv("prepped/ytest.csv", index=False)
+
+          for f in ["Xtrain.csv", "Xtest.csv", "ytrain.csv", "ytest.csv"]:
+              api.upload_file(
+                  path_or_fileobj=f"prepped/{f}",
+                  path_in_repo=f,
+                  repo_id=ds_repo,
+                  repo_type="dataset",
+              )
+              print(f"[UPLOAD] {f}")
+          print("[DONE] Data prep complete.")
+          PY
+
+  model-training:
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # If you have a repo-level requirements file for training, use it instead:
+          pip install pandas scikit-learn xgboost mlflow joblib huggingface_hub
+
+      - name: Train model (uses MLflow local file store)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_TRACKING_URI: file:./mlruns
+        run: |
+          python - <<'PY'
+          import os, time, json, joblib
+          import pandas as pd
+          import xgboost as xgb
+          from sklearn.model_selection import GridSearchCV
+          from sklearn.preprocessing import StandardScaler, OneHotEncoder
+          from sklearn.compose import make_column_transformer
+          from sklearn.pipeline import make_pipeline
+          from sklearn.metrics import classification_report
+          import mlflow
+          from huggingface_hub import HfApi
+
+          ds_repo = os.environ["DATASET_REPO"]
+          model_repo = os.environ["MODEL_REPO"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns"))
+          mlflow.set_experiment("visit-with-us-production-training")
+
+          # Load splits from HF dataset
+          base = f"hf://datasets/{ds_repo}"
+          Xtr = pd.read_csv(f"{base}/Xtrain.csv")
+          Xte = pd.read_csv(f"{base}/Xtest.csv")
+          ytr = pd.read_csv(f"{base}/ytrain.csv").iloc[:,0].astype(int)
+          yte = pd.read_csv(f"{base}/ytest.csv").iloc[:,0].astype(int)
+
+          # Feature groups
+          num_cols = [c for c in [
+              "Age","NumberOfPersonVisiting","PreferredPropertyStar","NumberOfTrips",
+              "NumberOfChildrenVisiting","MonthlyIncome","PitchSatisfactionScore",
+              "NumberOfFollowups","DurationOfPitch","Passport","OwnCar"
+          ] if c in Xtr.columns]
+          cat_cols = [c for c in [
+              "TypeofContact","CityTier","Occupation","Gender","MaritalStatus","Designation","ProductPitched"
+          ] if c in Xtr.columns]
+
+          # Class weight
+          neg = int((ytr==0).sum()); pos = int((ytr==1).sum())
+          if pos == 0: raise RuntimeError("No positives in training split.")
+          spw = neg/pos
+
+          pre = make_column_transformer(
+              (StandardScaler(), num_cols),
+              (OneHotEncoder(handle_unknown="ignore"), cat_cols)
+          )
+          clf = xgb.XGBClassifier(
+              scale_pos_weight=spw, random_state=42, objective="binary:logistic",
+              eval_metric="logloss", tree_method="hist", n_jobs=-1
+          )
+          pipe = make_pipeline(pre, clf)
+
+          grid = {
+              "xgbclassifier__n_estimators": [25,50,75],
+              "xgbclassifier__max_depth": [2,3,4],
+              "xgbclassifier__colsample_bytree": [0.4,0.5,0.6],
+              "xgbclassifier__colsample_bylevel": [0.4,0.5,0.6],
+              "xgbclassifier__learning_rate": [0.01,0.05,0.1],
+              "xgbclassifier__reg_lambda": [0.4,0.5,0.6],
+          }
+
+          with mlflow.start_run():
+              gs = GridSearchCV(pipe, grid, cv=5, n_jobs=-1, scoring="f1")
+              gs.fit(Xtr, ytr)
+
+              best = gs.best_estimator_
+              thr = 0.45
+              p_tr = (best.predict_proba(Xtr)[:,1] >= thr).astype(int)
+              p_te = (best.predict_proba(Xte)[:,1] >= thr).astype(int)
+
+              rep_tr = classification_report(ytr, p_tr, output_dict=True, zero_division=0)
+              rep_te = classification_report(yte, p_te, output_dict=True, zero_division=0)
+
+              mlflow.log_params(gs.best_params_)
+              mlflow.log_metrics({
+                  "train_accuracy": rep_tr["accuracy"],
+                  "train_precision": rep_tr["1"]["precision"],
+                  "train_recall":    rep_tr["1"]["recall"],
+                  "train_f1":        rep_tr["1"]["f1-score"],
+                  "test_accuracy":   rep_te["accuracy"],
+                  "test_precision":  rep_te["1"]["precision"],
+                  "test_recall":     rep_te["1"]["recall"],
+                  "test_f1":         rep_te["1"]["f1-score"],
+                  "threshold":       thr
+              })
+
+              # Save & upload model artifact to HF Model repo
+              os.makedirs("artifacts", exist_ok=True)
+              path = "artifacts/best_tourism_wellness_model_v1.joblib"
+              joblib.dump(best, path)
+
+              # Ensure model repo exists (type=model)
+              try:
+                  api.repo_info(repo_id=model_repo, repo_type="model")
+                  print(f"[OK] Model repo '{model_repo}' exists.")
+              except Exception:
+                  from huggingface_hub import create_repo
+                  print(f"[NEW] Creating model repo '{model_repo}'...")
+                  create_repo(repo_id=model_repo, repo_type="model", private=False)
+
+              api.upload_file(
+                  path_or_fileobj=path,
+                  path_in_repo=os.path.basename(path),
+                  repo_id=model_repo,
+                  repo_type="model",
+              )
+              print("[DONE] Model uploaded to HF.")
+          PY
+
+      - name: Upload model artifacts to GH Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: tourism-model-artifacts
+          path: artifacts/**
+
+  deploy-docker-space:
+    needs: [model-training, data-prep, register-dataset]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+
+      - name: Push Docker app files to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi, create_repo
+          from huggingface_hub.utils import RepositoryNotFoundError
+
+          space_id = os.environ["SPACE_REPO"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          # Ensure Space exists with docker SDK
+          try:
+              api.repo_info(repo_id=space_id, repo_type="space")
+              print(f"[OK] Space '{space_id}' exists.")
+          except RepositoryNotFoundError:
+              print(f"[NEW] Creating Space '{space_id}' (docker)…")
+              create_repo(repo_id=space_id, repo_type="space", private=False, space_sdk="docker")
+
+          files = [
+              ("Dockerfile", "Dockerfile"),
+              ("app.py", "app.py"),
+              ("requirements.txt", "requirements.txt"),
+              ("space.yaml", "space.yaml"),  # optional but recommended: sdk: docker, app_port: 7860
+          ]
+          for local, dest in files:
+              if not os.path.exists(local):
+                  raise FileNotFoundError(f"Missing file: {local}")
+              api.upload_file(
+                  path_or_fileobj=local,
+                  path_in_repo=dest,
+                  repo_id=space_id,
+                  repo_type="space",
+              )
+              print(f"[UPLOAD] {local} -> {space_id}:{dest}")
+          print("[DONE] Space updated. It will rebuild automatically.")
+          PY
