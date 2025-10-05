@@ -9,9 +9,9 @@ on:
 env:
   PYTHON_VERSION: "3.11"
   # Change all three to your real repos
-  DATASET_REPO: "your-username/tourism-prediction-package"   # HF Dataset repo
-  MODEL_REPO:   "your-username/tourism-prediction-package"   # HF Model repo (where joblib is uploaded)
-  SPACE_REPO:   "your-username/tourism-prediction-app"       # HF Space repo (Docker runtime)
+  DATASET_REPO: "Yashwanthsairam/package-tourism-predict"   # HF Dataset repo
+  MODEL_REPO:   "Yashwanthsairam/package-tourism-predict"   # HF Model repo (where joblib is uploaded)
+  SPACE_REPO:   "Yashwanthsairam/package-tourism-predict"       # HF Space repo (Docker runtime)
   # Optional: public URL to download CSV if not committed
   # Set in repo Variables or Secrets if you prefer
   # DATASET_SOURCE_URL: "https://raw.githubusercontent.com/<you>/<repo>/main/tourism.csv"
